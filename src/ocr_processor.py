@@ -17,41 +17,100 @@ logger = logging.getLogger(__name__)
 
 
 class SicalOCRProcessor:
-    """Process SICAL II screenshots to extract budget data"""
+    """Process SICAL II screenshots to extract budget data with enhanced OCR"""
 
-    def __init__(self):
-        # Configure pytesseract for Spanish
-        self.tesseract_config = r'--oem 3 --psm 6 -l spa'
+    def __init__(self, use_enhanced=True):
+        # Multiple Tesseract configurations to try
+        self.tesseract_configs = [
+            r'--oem 3 --psm 6 -l spa',
+            r'--oem 3 --psm 4 -l spa',
+            r'--oem 3 --psm 11 -l spa',
+            r'--oem 3 --psm 3 -l spa+eng',
+        ]
+        self.use_enhanced = use_enhanced
 
-    def preprocess_image(self, image_path):
+    def preprocess_image(self, image_path, method='advanced'):
         """Preprocess image for better OCR results"""
         # Read image
         img = cv2.imread(str(image_path))
 
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
 
-        # Apply thresholding to preprocess the image
-        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        if method == 'basic':
+            # Basic preprocessing
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+            gray = cv2.medianBlur(gray, 3)
+            return gray
 
-        # Denoise
-        gray = cv2.medianBlur(gray, 3)
+        elif method == 'advanced':
+            # Advanced preprocessing with contrast enhancement
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        return gray
+            # Apply CLAHE for contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            gray = clahe.apply(gray)
+
+            # Denoise
+            gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+
+            # Adaptive threshold
+            gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 11, 2)
+            return gray
+
+        elif method == 'contrast':
+            # Focus on text with high contrast
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Increase contrast
+            alpha = 1.8  # Contrast control
+            beta = 10    # Brightness control
+            gray = cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
+
+            # Binary threshold
+            _, gray = cv2.threshold(gray, 160, 255, cv2.THRESH_BINARY)
+
+            # Clean up noise
+            kernel = np.ones((2,2), np.uint8)
+            gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+
+            return gray
+
+        else:
+            # Default
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            return gray
 
     def extract_text(self, image_path):
-        """Extract all text from image"""
+        """Extract all text from image using multiple methods"""
         try:
-            # Preprocess
-            processed_img = self.preprocess_image(image_path)
+            best_text = ""
+            best_length = 0
 
-            # Convert to PIL Image
-            pil_img = Image.fromarray(processed_img)
+            # Try multiple preprocessing methods
+            for method in ['advanced', 'contrast', 'basic']:
+                try:
+                    processed_img = self.preprocess_image(image_path, method=method)
+                    pil_img = Image.fromarray(processed_img)
 
-            # Extract text
-            text = pytesseract.image_to_string(pil_img, config=self.tesseract_config)
+                    # Try each config
+                    for config in self.tesseract_configs:
+                        text = pytesseract.image_to_string(pil_img, config=config)
 
-            return text
+                        # Keep the result with most text
+                        if len(text) > best_length:
+                            best_text = text
+                            best_length = len(text)
+                            logger.debug(f"Better result with method={method}, config={config}")
+
+                except Exception as e:
+                    logger.debug(f"Method {method} failed: {e}")
+                    continue
+
+            return best_text
+
         except Exception as e:
             logger.error(f"Error extracting text from {image_path}: {e}")
             return ""
@@ -61,36 +120,83 @@ class SicalOCRProcessor:
         if not text:
             return None
 
-        # Remove whitespace
-        text = text.strip()
+        text = str(text).strip()
+
+        # Remove any non-numeric characters except . , -
+        text = re.sub(r'[^\d.,-]', '', text)
+
+        if not text or text in ['-', '.', ',', '']:
+            return None
 
         # Spanish format: 2.131.793,20 -> 2131793.20
-        # Remove dots (thousands separator)
-        text = text.replace('.', '')
-        # Replace comma with dot (decimal separator)
-        text = text.replace(',', '.')
+        # Count dots and commas to determine format
+        dots = text.count('.')
+        commas = text.count(',')
+
+        if dots > 0 and commas > 0:
+            # Has both - assume Spanish format: thousands with dot, decimal with comma
+            text = text.replace('.', '')
+            text = text.replace(',', '.')
+        elif commas == 1 and dots == 0:
+            # Only comma - decimal separator
+            text = text.replace(',', '.')
+        elif dots > 1:
+            # Multiple dots - thousands separators
+            text = text.replace('.', '')
+        elif dots == 1 and commas == 0:
+            # Single dot - could be decimal or thousands
+            # If it has 3 digits after dot, it's probably thousands
+            parts = text.split('.')
+            if len(parts) == 2 and len(parts[1]) == 3:
+                # Likely thousands separator
+                text = text.replace('.', '')
 
         try:
-            return float(text)
-        except ValueError:
+            value = float(text)
+            # Sanity check - values should be reasonable
+            if abs(value) > 1e15:  # Too large
+                return None
+            return value
+        except (ValueError, AttributeError):
             return None
 
     def extract_field_value(self, text, field_name, next_field=None):
-        """Extract numeric value following a field name"""
-        patterns = [
-            # Pattern 1: Field name followed by number on same or next line
-            rf'{field_name}\s*[\n\s]*?([\d.,]+)',
-            # Pattern 2: Field name in a box, number nearby
-            rf'{field_name}.*?([\d.,]+)',
-        ]
+        """Extract numeric value following a field name with improved patterns"""
+        # Handle OCR variations (ñ might be read as fi, n, etc.)
+        field_variants = [field_name]
 
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            if match:
-                number_str = match.group(1)
-                value = self.clean_number(number_str)
-                if value is not None:
-                    return value
+        if 'ñ' in field_name:
+            field_variants.append(field_name.replace('ñ', 'n'))
+            field_variants.append(field_name.replace('ñ', 'fi'))
+
+        all_patterns = []
+
+        for variant in field_variants:
+            patterns = [
+                # Pattern 1: Field name followed by number on same or next line
+                rf'{variant}\s*[:\s]+([0-9.,]+)',
+                # Pattern 2: Field name, optional colon, whitespace, then number
+                rf'{variant}\s*:?\s*([0-9.,]+)',
+                # Pattern 3: Field name in a box, number nearby (within 50 chars)
+                rf'{variant}.{{0,50}}?([0-9.,]+)',
+                # Pattern 4: More lenient - field name then any number within 100 chars
+                rf'{variant}.{{0,100}}?([0-9]{{1,3}}(?:[.,][0-9]{{3}})*(?:[.,][0-9]{{2}})?)',
+            ]
+            all_patterns.extend(patterns)
+
+        for pattern in all_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE | re.DOTALL)
+
+            for match in matches:
+                # Try all captured groups
+                for i in range(1, len(match.groups()) + 1):
+                    try:
+                        number_str = match.group(i)
+                        value = self.clean_number(number_str)
+                        if value is not None and value != 0:
+                            return value
+                    except:
+                        continue
 
         return None
 
@@ -107,8 +213,19 @@ class SicalOCRProcessor:
 
         return None, None
 
+    def find_all_numbers(self, text):
+        """Find all numbers in text"""
+        pattern = r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?|\d+(?:[.,]\d{2})?)'
+        matches = re.findall(pattern, text)
+        numbers = []
+        for match in matches:
+            num = self.clean_number(match)
+            if num is not None:
+                numbers.append(num)
+        return numbers
+
     def extract_data(self, image_path):
-        """Extract all relevant data from screenshot"""
+        """Extract all relevant data from screenshot with enhanced methods"""
         logger.info(f"Processing: {image_path}")
 
         # Extract text
@@ -118,48 +235,111 @@ class SicalOCRProcessor:
             logger.warning(f"No text extracted from {image_path}")
             return None
 
-        # Extract year (Año)
-        year_match = re.search(r'Año\s*(\d{4})', text, re.IGNORECASE)
-        year = int(year_match.group(1)) if year_match else None
+        logger.debug(f"Extracted text length: {len(text)} characters")
+        logger.debug(f"First 500 chars: {text[:500]}")
 
-        # Extract concept code (Concepto)
-        concept_match = re.search(r'Concepto\s*(\d+)', text, re.IGNORECASE)
-        concept = concept_match.group(1) if concept_match else None
+        # Extract year (Año) - try multiple patterns
+        year = None
+        year_patterns = [
+            r'A[ñn]o[:\s]+(\d{4})',
+            r'Afio[:\s]+(\d{4})',  # OCR might confuse ñ
+            r'\b(20[0-9]{2})\b',   # Just find a year
+        ]
+
+        for pattern in year_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                year = int(match.group(1))
+                if 2000 <= year <= 2100:
+                    break
+
+        # Extract concept code (Concepto) - try multiple patterns
+        concept = None
+        concept_patterns = [
+            r'Concepto[:\s]+(\d{5})',
+            r'Concepto[:\s]+(\d{4,6})',
+            r'(?:Concepto|concepto)[:\s]+(\d+)',
+        ]
+
+        for pattern in concept_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                concept = match.group(1)
+                break
+
+        # If not found, look for 5-digit numbers in first lines
+        if not concept:
+            first_lines = '\n'.join(text.split('\n')[:10])
+            five_digit = re.findall(r'\b(\d{5})\b', first_lines)
+            if five_digit:
+                concept = five_digit[0]
 
         # Extract concept description
-        desc_match = re.search(r'INGRESOS EN CUENTAS OPERATIVAS.*', text, re.IGNORECASE)
-        concept_desc = desc_match.group(0) if desc_match else None
+        concept_desc = None
+        desc_patterns = [
+            r'INGRESOS[^\n]*',
+            r'INGRESOS.*?(?=\n|$)',
+        ]
+
+        for pattern in desc_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                concept_desc = match.group(0).strip()
+                break
 
         # Extract Saldo Inicial (Deudor/Acreedor)
-        saldo_inicial_deudor, saldo_inicial_acreedor = self.extract_two_column_values(
-            text, 'Saldo Inicial'
-        )
+        saldo_inicial_deudor = None
+        saldo_inicial_acreedor = None
 
-        # If two-column extraction failed, try individual extraction
-        if saldo_inicial_deudor is None:
-            # Try to find "Deudor" and "Acreedor" labels
-            deudor_match = re.search(r'Deudor\s+([\d.,]+)', text, re.IGNORECASE)
-            acreedor_match = re.search(r'Acreedor\s+([\d.,]+)', text, re.IGNORECASE)
+        # Try to find Deudor and Acreedor values
+        deudor_patterns = [
+            r'Deudor[:\s]+([0-9.,]+)',
+            r'Saldo\s+Inicial[:\s]+Deudor[:\s]+([0-9.,]+)',
+        ]
 
-            if deudor_match:
-                saldo_inicial_deudor = self.clean_number(deudor_match.group(1))
-            if acreedor_match:
-                saldo_inicial_acreedor = self.clean_number(acreedor_match.group(1))
+        acreedor_patterns = [
+            r'Acreedor[:\s]+([0-9.,]+)',
+            r'Saldo\s+Inicial[:\s]+Acreedor[:\s]+([0-9.,]+)',
+        ]
 
-        # Extract Total Haber
+        for pattern in deudor_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                saldo_inicial_deudor = self.clean_number(matches[0])
+                if saldo_inicial_deudor is not None:
+                    break
+
+        for pattern in acreedor_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                saldo_inicial_acreedor = self.clean_number(matches[0])
+                if saldo_inicial_acreedor is not None:
+                    break
+
+        # Extract movements
         total_haber = self.extract_field_value(text, 'Total Haber')
+        if total_haber is None:
+            total_haber = self.extract_field_value(text, 'Haber')
 
-        # Extract Total Debe
         total_debe = self.extract_field_value(text, 'Total Debe')
+        if total_debe is None:
+            total_debe = self.extract_field_value(text, 'Debe')
 
-        # Extract Propuestas de M/P
+        # Extract Propuestas
         propuestas_mp = self.extract_field_value(text, 'Propuestas de M/P')
+        if propuestas_mp is None:
+            propuestas_mp = self.extract_field_value(text, 'Propuestas de M')
+        if propuestas_mp is None:
+            propuestas_mp = self.extract_field_value(text, 'Propuestas')
 
-        # Extract Saldo Pendiente Acreedor
+        # Extract pending balances
         saldo_pend_acreedor = self.extract_field_value(text, 'Saldo Pendiente Acreedor')
+        if saldo_pend_acreedor is None:
+            saldo_pend_acreedor = self.extract_field_value(text, 'Pendiente Acreedor')
 
-        # Extract Saldo Pendiente Deudor
         saldo_pend_deudor = self.extract_field_value(text, 'Saldo Pendiente Deudor')
+        if saldo_pend_deudor is None:
+            saldo_pend_deudor = self.extract_field_value(text, 'Pendiente Deudor')
 
         # Extract date from image filename or current date
         date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -179,7 +359,11 @@ class SicalOCRProcessor:
             'saldo_pendiente_deudor': saldo_pend_deudor
         }
 
+        # Log what was found
+        found_fields = [k for k, v in data.items() if v is not None and k not in ['timestamp', 'image_file']]
+        logger.info(f"Found {len(found_fields)} fields: {', '.join(found_fields)}")
         logger.info(f"Extracted data: {data}")
+
         return data
 
     def extract_with_regions(self, image_path):

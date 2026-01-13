@@ -16,3 +16,7 @@ plotly==5.19.0
 
 # Utilities
 python-dateutil==2.8.2
+
+# Optional: Alternative OCR engine (install if Tesseract doesn't work well)
+# Uncomment the line below to install EasyOCR:
+# easyocr==1.7.0
