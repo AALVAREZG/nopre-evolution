@@ -15,11 +15,26 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Try to import EasyOCR
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+    logger.info("✓ EasyOCR is available and will be used as default")
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    logger.info("⚠ EasyOCR not available, using Tesseract")
+
 
 class SicalOCRProcessor:
     """Process SICAL II screenshots to extract budget data with enhanced OCR"""
 
-    def __init__(self, use_enhanced=True):
+    def __init__(self, use_easyocr='auto'):
+        """
+        Initialize OCR processor
+
+        Args:
+            use_easyocr: 'auto' (default if available), True (force), False (use Tesseract)
+        """
         # Multiple Tesseract configurations to try
         self.tesseract_configs = [
             r'--oem 3 --psm 6 -l spa',
@@ -27,7 +42,27 @@ class SicalOCRProcessor:
             r'--oem 3 --psm 11 -l spa',
             r'--oem 3 --psm 3 -l spa+eng',
         ]
-        self.use_enhanced = use_enhanced
+
+        # Determine which OCR to use
+        if use_easyocr == 'auto':
+            self.use_easyocr = EASYOCR_AVAILABLE
+        elif use_easyocr is True and not EASYOCR_AVAILABLE:
+            logger.warning("EasyOCR requested but not available, falling back to Tesseract")
+            self.use_easyocr = False
+        else:
+            self.use_easyocr = use_easyocr
+
+        # Initialize EasyOCR if needed
+        self.easyocr_reader = None
+        if self.use_easyocr:
+            logger.info("Initializing EasyOCR (this may take a moment)...")
+            try:
+                self.easyocr_reader = easyocr.Reader(['es', 'en'], gpu=False)
+                logger.info("✓ EasyOCR initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize EasyOCR: {e}")
+                self.use_easyocr = False
+                logger.info("Falling back to Tesseract")
 
     def preprocess_image(self, image_path, method='advanced'):
         """Preprocess image for better OCR results"""
@@ -86,6 +121,44 @@ class SicalOCRProcessor:
     def extract_text(self, image_path):
         """Extract all text from image using multiple methods"""
         try:
+            # If EasyOCR is available, use it
+            if self.use_easyocr and self.easyocr_reader:
+                logger.info("Using EasyOCR for text extraction")
+                return self._extract_text_easyocr(image_path)
+            else:
+                logger.info("Using Tesseract for text extraction")
+                return self._extract_text_tesseract(image_path)
+
+        except Exception as e:
+            logger.error(f"Error extracting text from {image_path}: {e}")
+            return ""
+
+    def _extract_text_easyocr(self, image_path):
+        """Extract text using EasyOCR"""
+        try:
+            logger.debug(f"Running EasyOCR on {image_path}")
+            result = self.easyocr_reader.readtext(str(image_path))
+
+            # Combine all detected text
+            texts = []
+            for (bbox, text, prob) in result:
+                if prob > 0.3:  # Only include confident detections
+                    texts.append(text)
+
+            combined_text = '\n'.join(texts)
+            logger.info(f"EasyOCR extracted {len(texts)} text blocks, {len(combined_text)} chars")
+
+            return combined_text
+
+        except Exception as e:
+            logger.error(f"EasyOCR failed: {e}")
+            # Fallback to Tesseract
+            logger.info("Falling back to Tesseract")
+            return self._extract_text_tesseract(image_path)
+
+    def _extract_text_tesseract(self, image_path):
+        """Extract text using Tesseract with multiple preprocessing methods"""
+        try:
             best_text = ""
             best_length = 0
 
@@ -109,10 +182,11 @@ class SicalOCRProcessor:
                     logger.debug(f"Method {method} failed: {e}")
                     continue
 
+            logger.info(f"Tesseract extracted {best_length} chars")
             return best_text
 
         except Exception as e:
-            logger.error(f"Error extracting text from {image_path}: {e}")
+            logger.error(f"Tesseract extraction failed: {e}")
             return ""
 
     def clean_number(self, text):
