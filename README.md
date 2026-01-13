@@ -194,7 +194,58 @@ latest = db.get_latest_data()
 all_data = db.get_all_data()
 ```
 
+## 🧪 Probar y Depurar el OCR
+
+Si el OCR no extrae correctamente los datos, usa estas herramientas:
+
+### Script de Prueba
+
+```bash
+python test_ocr.py screenshots/tu-imagen.png
+```
+
+Muestra:
+- El texto RAW extraído por OCR
+- Los datos estructurados obtenidos
+
+### Debug de Preprocesamiento
+
+```bash
+python debug_preprocessing.py screenshots/tu-imagen.png
+```
+
+Genera imágenes preprocesadas en `debug_images/` para identificar qué método funciona mejor.
+
+### Usar EasyOCR como Alternativa
+
+Si Tesseract no funciona bien, prueba EasyOCR:
+
+```bash
+# Instalar EasyOCR
+pip install easyocr
+
+# Probar con EasyOCR
+python src/ocr_easyocr.py
+```
+
+EasyOCR suele ser más preciso con interfaces gráficas complejas.
+
 ## 🛠️ Solución de Problemas
+
+### Todos los campos extraídos son None
+
+**Causas comunes**:
+- Tesseract no está instalado correctamente
+- El idioma español no está disponible en Tesseract
+- La calidad de la captura es muy baja
+- El layout de SICAL II es diferente al esperado
+
+**Soluciones**:
+1. Verificar instalación de Tesseract: `tesseract --version`
+2. Verificar idioma español: `tesseract --list-langs | grep spa`
+3. Ejecutar `python test_ocr.py` para diagnóstico
+4. Ejecutar `python debug_preprocessing.py` para ver preprocesamiento
+5. Consultar la [Guía de Solución de Problemas](TROUBLESHOOTING.md)
 
 ### Tesseract no encontrado
 
@@ -202,14 +253,24 @@ all_data = db.get_all_data()
 
 **Solución**: Asegúrate de que Tesseract está instalado y en el PATH del sistema.
 
+```bash
+# Ubuntu/Debian
+sudo apt-get install tesseract-ocr tesseract-ocr-spa
+
+# Verificar instalación
+tesseract --version
+```
+
 ### Extracción de datos incorrecta
 
 **Problema**: Los datos extraídos no son precisos
 
 **Soluciones**:
-- Asegúrate de que las capturas tienen buena calidad
-- Las imágenes deben tener suficiente resolución
-- Verifica que el idioma español está instalado en Tesseract
+- Usa capturas en formato PNG de alta resolución
+- Asegúrate de que el zoom está al 100%
+- Verifica que el texto es legible en la captura original
+- Prueba con EasyOCR: `pip install easyocr`
+- Consulta [TROUBLESHOOTING.md](TROUBLESHOOTING.md) para más detalles
 
 ### El monitor no detecta nuevos archivos
 
